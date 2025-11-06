@@ -1,4 +1,4 @@
-# Implementation of the algorithms from "Differentially Private Policy Gradient", under review at ICML 2025.
+# Implementation of the algorithms from "Differentially Private Policy Gradient", available as a pre-print at https://arxiv.org/abs/2402.05525.
 
 The implementation of DPPG (discrete and continuous) is based on the cleanRL implementation of PPO.
 
@@ -15,3 +15,4 @@ To run the experiments, use for instance the following command:
 ```python dppg_discrete.py --env_id $ENV_ID --args```
 
 The relevant hyperparameters can be found in the paper.
+
