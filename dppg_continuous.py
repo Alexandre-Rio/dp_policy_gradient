@@ -80,14 +80,10 @@ class Args:
     """the maximum norm for the gradient clipping"""
     max_grad_norm_value: float = 0.5
     """the maximum norm for the gradient clipping of the value function"""
-    per_layer_update: bool = False
-    """whether to use to per_layer_update or not"""
     target_kl: float = None
     """the target KL divergence threshold"""
     noise_multiplier: float = 0.5
     """the noise multiplier for the DP noise"""
-    original_clipping: bool = False
-    """use original gradient clipping instead of Fed. Clipping (for debugging)"""
     forward_adam_states: bool = True
     """whether to forward adam state from iteration to iteration or not"""
     num_hidden_neurons: int = 64
@@ -206,15 +202,12 @@ def train(args, save_model=False):
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    # Initialize global agent, local agents and corresponding optimizers (DPPG logic)
     agent = Agent(envs, args.num_hidden_neurons).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=1, eps=1e-5)
     local_agents = [copy.deepcopy(agent) for _ in range(len(pools))]
     local_optimizers = [optim.Adam(local_agents[i].parameters(), lr=args.learning_rate, eps=1e-5) for i in
                         range(len(local_agents))]
-    if args.per_layer_update:
-        param_normalizer = 0
-        for param in agent.parameters():
-            param_normalizer += 1 / param.shape[0]
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -239,7 +232,7 @@ def train(args, save_model=False):
             for opt in local_optimizers:
                 opt.param_groups[0]["lr"] = lrnow
 
-        # Load past aggregated gradient
+        # Forward private gradient to local Adam states for privacy (DPPG logic)
         if args.forward_adam_states and iteration >= 2:
             for opt in local_optimizers:
                 for opt_param, param in zip(opt.param_groups[0]['params'], agg_gradient.values()):
@@ -290,6 +283,8 @@ def train(args, save_model=False):
             returns = advantages + values
 
         # Optimizing the policy and value network
+
+        # Initialize private agg gradient and store initial params (DPPG logic)
         init_params = {}
         agg_gradient = {}
         for name, param in agent.named_parameters():
@@ -297,9 +292,6 @@ def train(args, save_model=False):
             init_params[name] = copy.deepcopy(param)
 
         # For monitoring
-        #clipping_steps = 0
-        #agg_gradient_norm = 0
-        #agg_clipping_factor = 0
         for pool_id in range(len(pools)):
             local_agent = local_agents[pool_id]
             local_optimizer = local_optimizers[pool_id]
@@ -341,7 +333,7 @@ def train(args, save_model=False):
                     if not args.no_ppo_clip:
                         pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    else:
+                    else:  # DP clipping can replace PPO clipping
                         pg_loss = pg_loss1.mean()
 
                     # Value loss
@@ -364,58 +356,47 @@ def train(args, save_model=False):
 
                     local_optimizer.zero_grad()
                     loss.backward()
-                    if args.original_clipping:
-                        nn.utils.clip_grad_norm_(local_agent.parameters(), args.max_grad_norm)
                     local_optimizer.step()
 
-                    # Clipping step
-                    if not args.original_clipping:
-                        with torch.no_grad():
-                            local_update = {}
-                            if not args.per_layer_update:
-                                local_update_norm_policy = 0
-                                local_update_norm_value = 0
-                                for name, param in local_agent.named_parameters():
-                                    diff = param - init_params[name]
-                                    local_update[name] = diff
-                                    diff_norm = torch.norm(diff) ** 2
-                                    if name.startswith('actor'):
-                                        local_update_norm_policy += diff_norm
-                                    else:
-                                        local_update_norm_value += diff_norm
-                                local_update_norm_policy = local_update_norm_policy ** 0.5
-                                local_update_norm_value = local_update_norm_value ** 0.5
+                    # DP clipping step (DPPG logic)
+                    with torch.no_grad():
+                        local_update = {}
+                        local_update_norm_policy = 0
+                        local_update_norm_value = 0
 
-                                clip_factor_policy = np.max([1, local_update_norm_policy.cpu() / (args.max_grad_norm)])
-                                clip_factor_value = np.max(
-                                    [1, local_update_norm_value.cpu() / (args.max_grad_norm_value)])
-
-                                for name, param in local_agent.named_parameters():
-                                    if name.startswith('actor'):
-                                        local_update[name] /= clip_factor_policy
-                                    else:
-                                        local_update[name] /= clip_factor_value
-                                    param.copy_(init_params[name] + local_update[name])
+                        # Compute local update norms
+                        for name, param in local_agent.named_parameters():
+                            diff = param - init_params[name]
+                            local_update[name] = diff
+                            diff_norm = torch.norm(diff) ** 2
+                            if name.startswith('actor'):
+                                local_update_norm_policy += diff_norm
                             else:
-                                for name, param in local_agent.named_parameters():
-                                    diff = param - init_params[name]
-                                    diff_norm = torch.norm(diff) ** 2
-                                    scaled_clip = args.max_grad_norm / (param.shape[0] / param_normalizer)
-                                    clip_factor = np.max([1, diff_norm ** 0.5 / scaled_clip])
-                                    local_update[name] = diff / clip_factor
-                                for name, param in local_agent.named_parameters():
-                                    param.copy_(init_params[name] + local_update[name])  # local_update already clipped
+                                local_update_norm_value += diff_norm
+                        local_update_norm_policy = local_update_norm_policy ** 0.5
+                        local_update_norm_value = local_update_norm_value ** 0.5
+
+                        # Compute clipping factors
+                        clip_factor_policy = np.max([1, local_update_norm_policy.cpu() / (args.max_grad_norm)])
+                        clip_factor_value = np.max(
+                            [1, local_update_norm_value.cpu() / (args.max_grad_norm_value)])
+
+                        # Update local parameters
+                        for name, param in local_agent.named_parameters():
+                            if name.startswith('actor'):
+                                local_update[name] /= clip_factor_policy
+                            else:
+                                local_update[name] /= clip_factor_value
+                            param.copy_(init_params[name] + local_update[name])
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
 
-            # Update the aggregated gradient
+            # Update aggregated gradient (DPPG Logic)
             for name, param in local_agent.named_parameters():
                 agg_gradient[name] += (param - init_params[name]) / (len(pools))
 
-            #print(f"Avg. Gradient Norm: {agg_gradient_norm / clipping_steps:.5f}")
-            #print(f"Avg. Clipping Factor: {agg_clipping_factor / clipping_steps:.5f}")
-
+        # Add DP noise and manually update parameters (DPPG logic)
         with torch.no_grad():
             sigma = args.noise_multiplier * args.max_grad_norm / (len(pools))
             for name, param in agent.named_parameters():
@@ -424,6 +405,7 @@ def train(args, save_model=False):
                         device)
                 param.copy_(init_params[name] + agg_gradient[name])
 
+        # Log metrics
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
@@ -456,3 +438,4 @@ if __name__ == '__main__':
         print(f'Training env {args.env_id} / seed {seed + 1}/{n_seeds}')
         setattr(args, 'seed', seed)
         train(args)
+
